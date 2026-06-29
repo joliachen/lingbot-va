@@ -47,6 +47,23 @@ from dataset import MultiLatentLeRobotDataset
 import gc
 
 
+def _action_expert_is_initialised(transformer) -> bool:
+    """Return True if the action expert FFN has already been copy-inited.
+
+    Heuristic: after copy-init the action FFN weight norm is comparable to
+    the video FFN weight norm (both scaled by alpha=2).  A freshly-loaded
+    base checkpoint has randomly-initialised action_ffn weights whose norm
+    is orders of magnitude smaller than the video FFN weights.
+    """
+    b0 = transformer.blocks[0]
+    v_norm = b0.ffn.net[0].proj.weight.float().norm().item()
+    a_norm = b0.action_ffn.net[0].proj.weight.float().norm().item()
+    # After copy-init: a_norm ≈ v_norm * alpha * sqrt(action_inner/video_inner)
+    # Random init:     a_norm << v_norm (by ~sqrt(video_inner/action_inner) ≈ 4x)
+    ratio = a_norm / (v_norm + 1e-8)
+    return ratio > 0.1   # well above random-init noise floor
+
+
 class Trainer:
     def __init__(self, config):
         if config.enable_wandb and config.rank == 0:
@@ -88,6 +105,40 @@ class Trainer:
             attn_mode="flex"
         )
 
+        # MoT action expert: init from video weights only when action expert is uninitialised.
+        # Skip if: (a) not using MoT, (b) resuming from a MoT checkpoint, or
+        # (c) loading a pre-converted MoT checkpoint (action_ffn weights already non-random).
+        use_mot = getattr(config, 'use_mot_action_expert', False)
+        is_resume = hasattr(config, 'resume_from') and config.resume_from
+        action_expert_already_init = _action_expert_is_initialised(self.transformer)
+        if use_mot and not is_resume and not action_expert_already_init:
+            logger.info("Initialising Action Expert FFN from video weights (MoT copy-init)...")
+            self.transformer.init_action_expert_from_video()
+        elif use_mot and action_expert_already_init:
+            logger.info("Action Expert FFN weights already initialised (pre-converted checkpoint) — skipping copy-init.")
+
+        # Freeze backbone when requested (must happen before FSDP sharding).
+        freeze_backbone = getattr(config, 'freeze_backbone', False)
+        if use_mot and freeze_backbone:
+            logger.info("Freezing backbone; training only action expert parameters ...")
+            self.transformer.requires_grad_(False)
+            # All action-stream parameters: QKV projections, output projections,
+            # cross-attention Q, norms, FFN, modulation tables, embedder+head
+            _ACTION_EXPERT_NAMES = (
+                'action_to_q', 'action_to_k', 'action_to_v', 'action_to_out',
+                'action_norm1', 'action_cross_to_q', 'action_cross_to_out', 'action_norm2',
+                'action_ffn', 'action_norm3', 'action_scale_shift_table',
+                'action_embedder', 'action_proj_out',
+                'action_norm_out', 'action_scale_shift_table_final',
+                'condition_embedder_action',
+            )
+            for name, param in self.transformer.named_parameters():
+                if any(seg in name for seg in _ACTION_EXPERT_NAMES):
+                    param.requires_grad_(True)
+            n_trainable = sum(p.numel() for p in self.transformer.parameters() if p.requires_grad)
+            n_total     = sum(p.numel() for p in self.transformer.parameters())
+            logger.info(f"  Trainable: {n_trainable/1e6:.1f}M / {n_total/1e6:.1f}M params")
+
         logger.info("Setting up activation checkpointing ...")
         apply_ac(self.transformer)
 
@@ -101,7 +152,8 @@ class Trainer:
             eval_mode=False,
         )
         self.transformer.train()
-        self.transformer.requires_grad_(True)
+        if not (use_mot and freeze_backbone):
+            self.transformer.requires_grad_(True)
 
         # Optimizer
         self.optimizer = torch.optim.AdamW(
@@ -519,6 +571,10 @@ def run(args):
 
     if args.save_root is not None:
         config.save_root = args.save_root
+    if args.num_steps is not None:
+        config.num_steps = args.num_steps
+    if args.save_interval is not None:
+        config.save_interval = args.save_interval
 
     if rank == 0:
         logger.info(f"Using config: {args.config_name}")
@@ -542,6 +598,18 @@ def main():
         type=str,
         default=None,
         help="Root directory for saving checkpoints",
+    )
+    parser.add_argument(
+        "--num-steps",
+        type=int,
+        default=None,
+        help="Override config num_steps",
+    )
+    parser.add_argument(
+        "--save-interval",
+        type=int,
+        default=None,
+        help="Override config save_interval",
     )
 
     args = parser.parse_args()

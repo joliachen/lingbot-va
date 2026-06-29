@@ -12,7 +12,7 @@ def _configure_model(model, shard_fn, param_dtype, device, eval_mode=True):
     if dist.is_initialized():
         dist.barrier()
 
-    if dist.is_initialized():
+    if dist.is_initialized() and dist.get_world_size() > 1:
         model = shard_fn(model)
     else:
         model.to(param_dtype)

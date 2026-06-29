@@ -26,10 +26,13 @@ from torch.nn.attention.flex_attention import (
 )
 from functools import partial
 
-try:
-    from flash_attn_interface import flash_attn_func
-except:
-    from flash_attn import flash_attn_func
+def flash_attn_func(*args, **kwargs):
+    # Lazy import: only loaded when attn_mode='flashattn'
+    try:
+        from flash_attn_interface import flash_attn_func as _fa
+    except ImportError:
+        from flash_attn import flash_attn_func as _fa
+    return _fa(*args, **kwargs)
 
 __all__ = ['WanTransformer3DModel']
 
@@ -475,6 +478,7 @@ class WanTransformerBlock(nn.Module):
         cross_attn_norm=False,
         eps=1e-6,
         attn_mode: str = "flashattn",
+        action_hidden_dim: int = 768,
     ):
         super().__init__()
         self.attn_mode = attn_mode
@@ -503,7 +507,7 @@ class WanTransformerBlock(nn.Module):
             dim, eps,
             elementwise_affine=True) if cross_attn_norm else nn.Identity()
 
-        # 3. Feed-forward
+        # 3. Video Expert FFN
         self.ffn = FeedForward(dim,
                                inner_dim=ffn_dim,
                                activation_fn="gelu-approximate")
@@ -512,58 +516,210 @@ class WanTransformerBlock(nn.Module):
         self.scale_shift_table = nn.Parameter(
             torch.randn(1, 6, dim) / dim**0.5)
 
+        # 4. Action Expert — full da=768 stream (paper-correct architecture)
+        # da/dv ratio = 768/3072 = 1/4; da_ffn = ffn_dim * (da/dv) = 3584
+        da = action_hidden_dim
+        dv = dim
+        da_ffn = int(ffn_dim * da / dv)          # 14336 × (768/3072) = 3584
+        self.action_hidden_dim = da
+
+        # Separate QKV projections: action input at da → joint attention at dv
+        self.action_to_q   = nn.Linear(da, dv)
+        self.action_to_k   = nn.Linear(da, dv)
+        self.action_to_v   = nn.Linear(da, dv)
+        self.action_to_out = nn.Linear(dv, da)   # project attention output back to da
+
+        # Pre-self-attention norm for action tokens at da
+        self.action_norm1 = FP32LayerNorm(da, eps, elementwise_affine=False)
+
+        # Separate Q projection for action cross-attention (keys/values shared with video)
+        self.action_cross_to_q   = nn.Linear(da, dv)
+        self.action_cross_to_out = nn.Linear(dv, da)
+        self.action_norm2 = (FP32LayerNorm(da, eps, elementwise_affine=True)
+                             if cross_attn_norm else nn.Identity())
+
+        # Action FFN: [da → da_ffn → da] = [768 → 3584 → 768]
+        self.action_ffn   = FeedForward(da, inner_dim=da_ffn, activation_fn="gelu-approximate")
+        self.action_norm3 = FP32LayerNorm(da, eps, elementwise_affine=False)
+
+        # AdaLN modulation at da (6 params: shift/scale/gate × SA + FFN)
+        self.action_scale_shift_table = nn.Parameter(
+            torch.randn(1, 6, da) / da**0.5)
+
     def forward(
         self,
-        hidden_states,
-        encoder_hidden_states,
-        temb,
-        rotary_emb,
+        hidden_states,           # video tokens [B, L_v, dv], or action tokens [B, L_a, da] in action_only
+        encoder_hidden_states,   # text [B, L_text, text_dim]
+        temb,                    # AdaLN timestep proj: video [B, L_v, 6, dv] or action [B, L_a, 6, da]
+        rotary_emb,              # [1, L, 1, C]
         update_cache=0,
         cache_name='pos',
-    ) -> torch.Tensor:
-        temb_scale_shift_table = self.scale_shift_table[None] + temb.float()
-        shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = \
-            rearrange(temb_scale_shift_table, 'b l n c -> b n l c').chunk(6, dim=1)
-        shift_msa = shift_msa.squeeze(1)
-        scale_msa = scale_msa.squeeze(1)
-        gate_msa = gate_msa.squeeze(1)
-        c_shift_msa = c_shift_msa.squeeze(1)
-        c_scale_msa = c_scale_msa.squeeze(1)
-        c_gate_msa = c_gate_msa.squeeze(1)
-        # 1. Self-attention
-        norm_hidden_states = (self.norm1(hidden_states.float()) *
-                              (1. + scale_msa) +
-                              shift_msa).type_as(hidden_states)
-        attn_output = self.attn1(norm_hidden_states,
-                                 norm_hidden_states,
-                                 norm_hidden_states,
-                                 rotary_emb,
-                                 update_cache=update_cache,
-                                 cache_name=cache_name)
-        hidden_states = (hidden_states.float() +
-                         attn_output * gate_msa).type_as(hidden_states)
+        # Two-stream MoT training args:
+        action_states=None,      # [B, L_a, da=768] — None ⇒ single-stream path
+        temb_action=None,        # [B, L_a, 6, da=768]
+        # Single-stream action-only inference:
+        action_only=False,       # True ⇒ run action expert layers on hidden_states at da=768
+    ):
+        # ── helpers ──────────────────────────────────────────────────────────
+        def _adaLN6(sst, temb_):
+            """Unpack 6 AdaLN modulation params from scale_shift_table + temb."""
+            out = rearrange(sst[None] + temb_.float(), 'b l n c -> b n l c').chunk(6, dim=1)
+            return [x.squeeze(1) for x in out]  # each [B, L, C]
 
-        # 2. Cross-attention
-        norm_hidden_states = self.norm2(
-            hidden_states.float()).type_as(hidden_states)
-        attn_output = self.attn2(norm_hidden_states,
-                                 encoder_hidden_states,
-                                 encoder_hidden_states,
-                                 None,
-                                 update_cache=0,
-                                 cache_name=cache_name)
-        hidden_states = hidden_states + attn_output
+        def _apply_rope(x, freqs):
+            x_c = torch.view_as_complex(
+                x.to(torch.float64).reshape(*x.shape[:3], -1, 2))
+            return torch.view_as_real(x_c * freqs).flatten(3).to(x.dtype)
 
-        # 3. Feed-forward
-        norm_hidden_states = (self.norm3(hidden_states.float()) *
-                              (1. + c_scale_msa) +
-                              c_shift_msa).type_as(hidden_states)
+        # ── Action-only single-stream inference path (da=768) ────────────
+        if action_only:
+            h_a = hidden_states   # [B, L_a, da=768]
+            nh, hd = self.attn1.heads, self.attn1.inner_dim // self.attn1.heads
+            sh_a, sc_a, g_a, c_sh_a, c_sc_a, c_g_a = _adaLN6(self.action_scale_shift_table, temb)
 
-        ff_output = self.ffn(norm_hidden_states)
+            # Original backbone weights may be DTensors (FSDP inference sharding).
+            # Action expert weights are plain tensors. Use local helpers to avoid mixing.
+            def _local(t):
+                """Gather a DTensor to a plain local tensor; no-op for regular tensors."""
+                if hasattr(t, 'full_tensor'):
+                    return t.full_tensor()
+                if hasattr(t, 'to_local'):
+                    return t.to_local()
+                return t
 
-        hidden_states = (hidden_states.float() +
-                         ff_output.float() * c_gate_msa).type_as(hidden_states)
-        return hidden_states
+            def _linear_local(x, lin):
+                return F.linear(x, _local(lin.weight).to(x.dtype),
+                                _local(lin.bias).to(x.dtype) if lin.bias is not None else None)
+
+            def _rms_norm_local(x, rms_mod):
+                return F.rms_norm(x, rms_mod.normalized_shape,
+                                  _local(rms_mod.weight).to(x.dtype), rms_mod.eps)
+
+            # Self-attention using action QKV projections (da→dv)
+            h_a_n = (self.action_norm1(h_a.float()) * (1. + sc_a) + sh_a).type_as(h_a)
+            q_a = _rms_norm_local(self.action_to_q(h_a_n), self.attn1.norm_q).unflatten(2, (nh, hd))
+            k_a = _rms_norm_local(self.action_to_k(h_a_n), self.attn1.norm_k).unflatten(2, (nh, hd))
+            v_a = self.action_to_v(h_a_n).unflatten(2, (nh, hd))
+            if rotary_emb is not None:
+                q_a = _apply_rope(q_a, rotary_emb)
+                k_a = _apply_rope(k_a, rotary_emb)
+            attn_out_a = custom_sdpa(q_a, k_a, v_a).flatten(2)   # [B, L_a, dv]
+            h_a = (h_a.float() + self.action_to_out(attn_out_a).float() * g_a).type_as(h_a)
+
+            # Cross-attention with text (K/V via attn2 — use _linear_local for DTensor weights)
+            h_a_n2 = self.action_norm2(h_a.float()).type_as(h_a)
+            q_ac = _rms_norm_local(self.action_cross_to_q(h_a_n2), self.attn2.norm_q).unflatten(2, (nh, hd))
+            k_txt_flat = _linear_local(encoder_hidden_states, self.attn2.to_k)
+            k_txt = _rms_norm_local(k_txt_flat, self.attn2.norm_k).unflatten(2, (nh, hd))
+            v_txt = _linear_local(encoder_hidden_states, self.attn2.to_v).unflatten(2, (nh, hd))
+            cross_out = custom_sdpa(q_ac, k_txt, v_txt).flatten(2)
+            h_a = h_a + self.action_cross_to_out(cross_out)
+
+            # FFN
+            h_a_n3 = (self.action_norm3(h_a.float()) * (1. + c_sc_a) + c_sh_a).type_as(h_a)
+            h_a = (h_a.float() + self.action_ffn(h_a_n3).float() * c_g_a).type_as(h_a)
+
+            return h_a, None
+
+        # ── Two-stream MoT training path ──────────────────────────────────
+        if action_states is not None:
+            h_v = hidden_states   # [B, L_v, dv]
+            h_a = action_states   # [B, L_a, da]
+            L_v = h_v.shape[1]
+
+            # Unpack video AdaLN (6 params at dv)
+            sh_v, sc_v, g_v, c_sh_v, c_sc_v, c_g_v = _adaLN6(self.scale_shift_table, temb)
+            # Unpack action AdaLN (6 params at da)
+            sh_a, sc_a, g_a, c_sh_a, c_sc_a, c_g_a = _adaLN6(self.action_scale_shift_table, temb_action)
+
+            # ── 1. Joint self-attention with separate QKV projections ────────
+            h_v_n = (self.norm1(h_v.float()) * (1. + sc_v) + sh_v).type_as(h_v)
+            h_a_n = (self.action_norm1(h_a.float()) * (1. + sc_a) + sh_a).type_as(h_a)
+
+            # Video QKV via shared attn1 projections [dv → dv]
+            q_v = self.attn1.to_q(h_v_n)
+            k_v = self.attn1.to_k(h_v_n)
+            v_v = self.attn1.to_v(h_v_n)
+
+            # Action QKV via separate projections [da → dv]
+            q_a = self.action_to_q(h_a_n)
+            k_a = self.action_to_k(h_a_n)
+            v_a = self.action_to_v(h_a_n)
+
+            # Concatenate joint sequence at dv
+            q = torch.cat([q_v, q_a], dim=1)
+            k = torch.cat([k_v, k_a], dim=1)
+            v = torch.cat([v_v, v_a], dim=1)
+
+            # QK norm + reshape to heads
+            nh, hd = self.attn1.heads, self.attn1.inner_dim // self.attn1.heads
+            q = self.attn1.norm_q(q).unflatten(2, (nh, hd))
+            k = self.attn1.norm_k(k).unflatten(2, (nh, hd))
+            v = v.unflatten(2, (nh, hd))
+
+            # RoPE (combined positions cover L_v + L_a)
+            if rotary_emb is not None:
+                q = _apply_rope(q, rotary_emb)
+                k = _apply_rope(k, rotary_emb)
+
+            # Attention — use standard SDPA (avoids FlexAttn mask-size constraints)
+            attn_out = custom_sdpa(q, k, v).flatten(2)  # [B, L_v+L_a, dv]
+
+            # Split + project out
+            out_v = self.attn1.to_out[0](attn_out[:, :L_v])
+            out_v = self.attn1.to_out[1](out_v)              # dropout (no-op in eval)
+            out_a = self.action_to_out(attn_out[:, L_v:])    # [B, L_a, da]
+
+            h_v = (h_v.float() + out_v.float() * g_v).type_as(h_v)
+            h_a = (h_a.float() + out_a.float() * g_a).type_as(h_a)
+
+            # ── 2. Cross-attention (text conditioning) ───────────────────────
+            # Video — unchanged through attn2
+            h_v_n2 = self.norm2(h_v.float()).type_as(h_v)
+            h_v = h_v + self.attn2(h_v_n2, encoder_hidden_states, encoder_hidden_states,
+                                   None, update_cache=0, cache_name=cache_name)
+
+            # Action — separate Q projection + shared K/V from text
+            h_a_n2 = self.action_norm2(h_a.float()).type_as(h_a)
+            q_ac = self.action_cross_to_q(h_a_n2).unflatten(2, (nh, hd))
+            q_ac = self.attn2.norm_q(q_ac.flatten(2)).unflatten(2, (nh, hd))
+            k_txt = self.attn2.to_k(encoder_hidden_states)
+            v_txt = self.attn2.to_v(encoder_hidden_states)
+            k_txt = self.attn2.norm_k(k_txt).unflatten(2, (nh, hd))
+            v_txt = v_txt.unflatten(2, (nh, hd))
+            cross_out = custom_sdpa(q_ac, k_txt, v_txt).flatten(2)  # [B, L_a, dv]
+            h_a = h_a + self.action_cross_to_out(cross_out)          # [B, L_a, da]
+
+            # ── 3. Feed-forward (separate experts) ───────────────────────────
+            # Video FFN
+            h_v_n3 = (self.norm3(h_v.float()) * (1. + c_sc_v) + c_sh_v).type_as(h_v)
+            h_v = (h_v.float() + self.ffn(h_v_n3).float() * c_g_v).type_as(h_v)
+
+            # Action FFN
+            h_a_n3 = (self.action_norm3(h_a.float()) * (1. + c_sc_a) + c_sh_a).type_as(h_a)
+            h_a = (h_a.float() + self.action_ffn(h_a_n3).float() * c_g_a).type_as(h_a)
+
+            return h_v, h_a
+
+        # ── Base / inference path (single stream at dv) ──────────────────
+        sst = self.scale_shift_table[None] + temb.float()
+        sh, sc, g, c_sh, c_sc, c_g = [x.squeeze(1) for x in
+            rearrange(sst, 'b l n c -> b n l c').chunk(6, dim=1)]
+
+        norm_h = (self.norm1(hidden_states.float()) * (1. + sc) + sh).type_as(hidden_states)
+        attn_out = self.attn1(norm_h, norm_h, norm_h, rotary_emb,
+                              update_cache=update_cache, cache_name=cache_name)
+        hidden_states = (hidden_states.float() + attn_out * g).type_as(hidden_states)
+
+        norm_h = self.norm2(hidden_states.float()).type_as(hidden_states)
+        hidden_states = hidden_states + self.attn2(norm_h, encoder_hidden_states,
+                                                   encoder_hidden_states, None,
+                                                   update_cache=0, cache_name=cache_name)
+
+        norm_h = (self.norm3(hidden_states.float()) * (1. + c_sc) + c_sh).type_as(hidden_states)
+        hidden_states = (hidden_states.float() + self.ffn(norm_h).float() * c_g).type_as(hidden_states)
+
+        return hidden_states, None
 
 
 class WanTransformer3DModel(ModelMixin, ConfigMixin):
@@ -572,24 +728,25 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
     """
     _supports_gradient_checkpointing = True
     _skip_layerwise_casting_patterns = [
-                                        # "patch_embedding", 
                                         "patch_embedding_mlp",
-                                        "condition_embedder", 
+                                        "condition_embedder",
                                         'condition_embedder_action',
                                         "norm"]
     _no_split_modules = ["WanTransformerBlock"]
-    _keep_in_fp32_modules = ["time_embedder", 
-                             "scale_shift_table", 
-                             "scale_shift_table_action",
-                             "norm1", 
+    _keep_in_fp32_modules = ["time_embedder",
+                             "scale_shift_table",
+                             "action_scale_shift_table_final",
+                             "norm1",
                              'action_norm1',
                              'text_norm1',
-                             "norm2", 
+                             "norm2",
                              'action_norm2',
                              'text_norm2',
                              "norm3",
                              'action_norm3',
-                             'text_norm3'
+                             'text_norm3',
+                             "norm_out",
+                             "action_norm_out",
                              ]
     _keys_to_ignore_on_load_unexpected = ["norm_added_q"]
     _repeated_blocks = ["WanTransformerBlock"]
@@ -610,7 +767,8 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
                  eps=1e-06,
                  rope_max_seq_len=1024,
                  pos_embed_seq_len=None,
-                 attn_mode="torch"):
+                 attn_mode="torch",
+                 action_hidden_dim: int = 768):
         r"""
         TODO
         """
@@ -618,13 +776,18 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
         self.patch_size = patch_size
         self.num_attention_heads = num_attention_heads
         self.attention_head_dim = attention_head_dim
-        inner_dim = num_attention_heads * attention_head_dim
+        inner_dim = num_attention_heads * attention_head_dim   # dv = 3072
+        da = action_hidden_dim                                  # da = 768
         self.rope = WanRotaryPosEmbed(attention_head_dim, patch_size,
                                       rope_max_seq_len)
         self.patch_embedding_mlp = nn.Linear(
             in_channels * patch_size[0] * patch_size[1] * patch_size[2],
             inner_dim)
-        self.action_embedder = nn.Linear(action_dim, inner_dim)
+
+        # Action stream embedder: 30-dim raw action → 768-dim action stream
+        self.action_embedder = nn.Linear(action_dim, da)
+
+        # Video condition embedder (at dv=3072)
         self.condition_embedder = WanTimeTextImageEmbedding(
             dim=inner_dim,
             time_freq_dim=freq_dim,
@@ -632,7 +795,14 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
             text_embed_dim=text_dim,
             pos_embed_seq_len=pos_embed_seq_len,
         )
-        self.condition_embedder_action = deepcopy(self.condition_embedder)
+        # Action condition embedder (at da=768, NOT a copy of video embedder)
+        self.condition_embedder_action = WanTimeTextImageEmbedding(
+            dim=da,
+            time_freq_dim=freq_dim,
+            time_proj_dim=da * 6,
+            text_embed_dim=text_dim,
+            pos_embed_seq_len=pos_embed_seq_len,
+        )
 
         self.blocks = nn.ModuleList([
             WanTransformerBlock(inner_dim,
@@ -640,15 +810,21 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
                                 num_attention_heads,
                                 cross_attn_norm,
                                 eps,
-                                attn_mode=attn_mode) for _ in range(num_layers)
+                                attn_mode=attn_mode,
+                                action_hidden_dim=da) for _ in range(num_layers)
         ])
 
+        # Video output head (at dv=3072)
         self.norm_out = FP32LayerNorm(inner_dim, eps, elementwise_affine=False)
-        self.proj_out = nn.Linear(inner_dim,
-                                  out_channels * math.prod(patch_size))
-        self.action_proj_out = nn.Linear(inner_dim, action_dim)
+        self.proj_out = nn.Linear(inner_dim, out_channels * math.prod(patch_size))
         self.scale_shift_table = nn.Parameter(
             torch.randn(1, 2, inner_dim) / inner_dim**0.5)
+
+        # Action output head (at da=768)
+        self.action_norm_out = FP32LayerNorm(da, eps, elementwise_affine=False)
+        self.action_proj_out = nn.Linear(da, action_dim)
+        self.action_scale_shift_table_final = nn.Parameter(
+            torch.randn(1, 2, da) / da**0.5)
 
     def clear_cache(self, cache_name):
         for block in self.blocks:
@@ -668,6 +844,177 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
                                       self.num_attention_heads,
                                       self.attention_head_dim, device, dtype, batch_size)
     
+    def init_action_expert_from_video(self):
+        """Copy-init Action Expert weights from Video Expert via dim interpolation + alpha scaling.
+
+        Paper rule (Sec 3.3): alpha = sqrt(dv / da) = sqrt(3072/768) = 2.0
+        Apply alpha ONLY when fan-in is compressed (input channels shrink).
+        Never apply to biases or additive/modulation params (scale_shift_table).
+
+        Mapping per block:
+          action_to_q/k/v.weight  [dv,da]  ← interp to_q/k/v.weight [dv,dv] dim=1, ×alpha
+          action_to_q/k/v.bias    [dv]     ← copy (same size)
+          action_to_out.weight    [da,dv]  ← interp to_out[0].weight [dv,dv] dim=0, no alpha
+          action_to_out.bias      [da]     ← interp to_out[0].bias [dv] dim=0, no alpha
+          action_cross_to_q same rules as action_to_q (source: attn2.to_q)
+          action_cross_to_out same rules as action_to_out (source: attn2.to_out[0])
+          action_ffn.net[0].proj.weight [da_ffn,da] ← interp [ffn_dim,dv] dim0+dim1, ×alpha
+          action_ffn.net[0].proj.bias   [da_ffn]    ← interp [ffn_dim] dim=0, no alpha
+          action_ffn.net[2].weight      [da,da_ffn] ← interp [dv,ffn_dim] dim0+dim1, ×alpha
+          action_ffn.net[2].bias        [da]         ← interp [dv] dim=0, no alpha
+          action_scale_shift_table      [1,6,da]    ← interp [1,6,dv] dim=2, no alpha
+        """
+        dv = self.num_attention_heads * self.attention_head_dim  # 3072
+        da = self.config.action_hidden_dim                        # 768
+        alpha = math.sqrt(dv / da)  # = 2.0
+
+        def interp_dim(w, new_len, dim):
+            """Linear interp of one axis of an arbitrary-rank float tensor."""
+            ndim = w.dim()
+            # Permute target dim to the last position
+            perm = list(range(ndim))
+            perm.pop(dim)
+            perm.append(dim)
+            inv_perm = [perm.index(i) for i in range(ndim)]
+            w = w.permute(*perm)                                     # [..., old_len]
+            old_shape = w.shape
+            w_flat = w.reshape(-1, old_shape[-1])                    # [N, old_len]
+            w_out = F.interpolate(w_flat.unsqueeze(1).float(),
+                                  size=new_len, mode='linear',
+                                  align_corners=False).squeeze(1)    # [N, new_len]
+            w = w_out.reshape(*old_shape[:-1], new_len)
+            return w.permute(*inv_perm)
+
+        with torch.no_grad():
+            for block in self.blocks:
+                # ── Self-attention: action_to_q/k/v, action_to_out ───────────
+                for src_name, dst_name in [
+                    ('attn1.to_q', 'action_to_q'),
+                    ('attn1.to_k', 'action_to_k'),
+                    ('attn1.to_v', 'action_to_v'),
+                ]:
+                    # Navigate dotted attr path
+                    src = block
+                    for part in src_name.split('.'): src = getattr(src, part)
+                    dst = getattr(block, dst_name)
+                    # weight [dv, dv] → [dv, da]: compress input dim=1, ×alpha
+                    dst.weight.copy_(interp_dim(src.weight.float(), da, dim=1) * alpha)
+                    if src.bias is not None and dst.bias is not None:
+                        dst.bias.copy_(src.bias.float())   # [dv] → [dv], same shape
+
+                # action_to_out: weight [dv,dv]→[da,dv] compress output dim=0, no alpha
+                src_out = block.attn1.to_out[0]
+                dst_out = block.action_to_out
+                dst_out.weight.copy_(interp_dim(src_out.weight.float(), da, dim=0))
+                if src_out.bias is not None and dst_out.bias is not None:
+                    dst_out.bias.copy_(interp_dim(src_out.bias.float(), da, dim=0))
+
+                # ── Cross-attention: action_cross_to_q, action_cross_to_out ──
+                src_xq = block.attn2.to_q
+                dst_xq = block.action_cross_to_q
+                dst_xq.weight.copy_(interp_dim(src_xq.weight.float(), da, dim=1) * alpha)
+                if src_xq.bias is not None and dst_xq.bias is not None:
+                    dst_xq.bias.copy_(src_xq.bias.float())
+
+                src_xout = block.attn2.to_out[0]
+                dst_xout = block.action_cross_to_out
+                dst_xout.weight.copy_(interp_dim(src_xout.weight.float(), da, dim=0))
+                if src_xout.bias is not None and dst_xout.bias is not None:
+                    dst_xout.bias.copy_(interp_dim(src_xout.bias.float(), da, dim=0))
+
+                # ── Action FFN ────────────────────────────────────────────────
+                v_ffn = block.ffn
+                a_ffn = block.action_ffn
+                da_ffn = a_ffn.net[0].proj.weight.shape[0]  # 3584
+
+                # net[0].proj.weight: [ffn_dim=14336, dv=3072] → [da_ffn=3584, da=768]
+                # compress dim=0 (14336→3584) then dim=1 (3072→768), ×alpha (fan-in compressed)
+                w = v_ffn.net[0].proj.weight.float()
+                w = interp_dim(w, da_ffn, dim=0)   # → [3584, 3072]
+                w = interp_dim(w, da,     dim=1)   # → [3584, 768]
+                a_ffn.net[0].proj.weight.copy_(w * alpha)
+
+                if v_ffn.net[0].proj.bias is not None and a_ffn.net[0].proj.bias is not None:
+                    a_ffn.net[0].proj.bias.copy_(
+                        interp_dim(v_ffn.net[0].proj.bias.float(), da_ffn, dim=0))
+
+                # net[2].weight: [dv=3072, ffn_dim=14336] → [da=768, da_ffn=3584]
+                # compress dim=0 (3072→768) then dim=1 (14336→3584), ×alpha (fan-in compressed)
+                w2 = v_ffn.net[2].weight.float()
+                w2 = interp_dim(w2, da,     dim=0)   # → [768, 14336]
+                w2 = interp_dim(w2, da_ffn, dim=1)   # → [768, 3584]
+                a_ffn.net[2].weight.copy_(w2 * alpha)
+
+                if v_ffn.net[2].bias is not None and a_ffn.net[2].bias is not None:
+                    a_ffn.net[2].bias.copy_(
+                        interp_dim(v_ffn.net[2].bias.float(), da, dim=0))
+
+                # ── action_scale_shift_table: [1,6,dv=3072] → [1,6,da=768], no alpha ──
+                block.action_scale_shift_table.copy_(
+                    interp_dim(block.scale_shift_table.float(), da, dim=2))
+
+        # ── condition_embedder_action: copy-init from condition_embedder ────────
+        # Each Linear in the action embedder has input/output dims scaled by da/dv.
+        # Apply alpha only when the action layer's fan-in is compressed vs the video layer.
+        #
+        # Layer mapping (src → dst, shape change, alpha?):
+        #  time_embedder.linear_1  [3072,256]→[768,256]    dim=0 compress, fan-in 256=256, NO alpha
+        #  time_embedder.linear_2  [3072,3072]→[768,768]   dim=0+dim=1,    fan-in 3072→768, ×alpha
+        #  time_proj               [18432,3072]→[4608,768] dim=0+dim=1,    fan-in 3072→768, ×alpha
+        #  text_embedder.linear_1  [3072,4096]→[768,4096]  dim=0 compress, fan-in 4096=4096, NO alpha
+        #  text_embedder.linear_2  [3072,3072]→[768,768]   dim=0+dim=1,    fan-in 3072→768, ×alpha
+        src_emb = self.condition_embedder
+        dst_emb = self.condition_embedder_action
+        time_proj_out_a = dst_emb.time_proj.weight.shape[0]  # da*6 = 4608
+
+        with torch.no_grad():
+            # time_embedder.linear_1: [dv,256]→[da,256], output-only compress, no alpha
+            w = src_emb.time_embedder.linear_1.weight.float()   # [3072, 256]
+            dst_emb.time_embedder.linear_1.weight.copy_(interp_dim(w, da, dim=0))
+            dst_emb.time_embedder.linear_1.bias.copy_(
+                interp_dim(src_emb.time_embedder.linear_1.bias.float(), da, dim=0))
+
+            # time_embedder.linear_2: [dv,dv]→[da,da], fan-in dv→da compressed, ×alpha
+            w = src_emb.time_embedder.linear_2.weight.float()   # [3072, 3072]
+            w = interp_dim(w, da, dim=0)   # [768, 3072]
+            w = interp_dim(w, da, dim=1)   # [768, 768]
+            dst_emb.time_embedder.linear_2.weight.copy_(w * alpha)
+            dst_emb.time_embedder.linear_2.bias.copy_(
+                interp_dim(src_emb.time_embedder.linear_2.bias.float(), da, dim=0))
+
+            # time_proj: [dv*6, dv]→[da*6, da], fan-in dv→da compressed, ×alpha
+            w = src_emb.time_proj.weight.float()                # [18432, 3072]
+            w = interp_dim(w, time_proj_out_a, dim=0)           # [4608, 3072]
+            w = interp_dim(w, da, dim=1)                        # [4608, 768]
+            dst_emb.time_proj.weight.copy_(w * alpha)
+            dst_emb.time_proj.bias.copy_(
+                interp_dim(src_emb.time_proj.bias.float(), time_proj_out_a, dim=0))
+
+            # text_embedder.linear_1: [dv,4096]→[da,4096], fan-in 4096=4096, no alpha
+            w = src_emb.text_embedder.linear_1.weight.float()   # [3072, 4096]
+            dst_emb.text_embedder.linear_1.weight.copy_(interp_dim(w, da, dim=0))
+            dst_emb.text_embedder.linear_1.bias.copy_(
+                interp_dim(src_emb.text_embedder.linear_1.bias.float(), da, dim=0))
+
+            # text_embedder.linear_2: [dv,dv]→[da,da], fan-in dv→da compressed, ×alpha
+            w = src_emb.text_embedder.linear_2.weight.float()   # [3072, 3072]
+            w = interp_dim(w, da, dim=0)   # [768, 3072]
+            w = interp_dim(w, da, dim=1)   # [768, 768]
+            dst_emb.text_embedder.linear_2.weight.copy_(w * alpha)
+            dst_emb.text_embedder.linear_2.bias.copy_(
+                interp_dim(src_emb.text_embedder.linear_2.bias.float(), da, dim=0))
+
+        # ── action_scale_shift_table_final: [1,2,dv]→[1,2,da], no alpha ────────
+        with torch.no_grad():
+            self.action_scale_shift_table_final.copy_(
+                interp_dim(self.scale_shift_table.float(), da, dim=2))
+
+        v_ffn = self.blocks[0].ffn
+        da_ffn = self.blocks[0].action_ffn.net[0].proj.weight.shape[0]
+        print(f"init_action_expert_from_video: alpha={alpha:.4f} (sqrt({dv}/{da}))")
+        print(f"  da={da}, da_ffn={da_ffn}, dv={dv}, ffn_dim={v_ffn.net[0].proj.weight.shape[0]}")
+        print(f"  condition_embedder_action initialized from condition_embedder")
+
     def _input_embed(self, latents, input_type='latent'):
         if input_type == 'latent':
             hidden_states = rearrange(
@@ -676,10 +1023,10 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
                 p1=self.patch_size[0],
                 p2=self.patch_size[1],
                 p3=self.patch_size[2])
-            hidden_states = self.patch_embedding_mlp(hidden_states)
+            hidden_states = self.patch_embedding_mlp(hidden_states)  # → [B, L, dv=3072]
         elif input_type == 'action':
             hidden_states = rearrange(latents, 'b c f h w -> b (f h w) c')
-            hidden_states = self.action_embedder(hidden_states)
+            hidden_states = self.action_embedder(hidden_states)       # → [B, L, da=768]
         elif input_type == 'text':
             hidden_states = self.condition_embedder.text_embedder(latents)
         else:
@@ -701,101 +1048,86 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
 
     def forward_train(self, input_dict):
         input_dict['latent_dict']['noisy_latents'] = input_dict['latent_dict']['noisy_latents'].to(torch.bfloat16)
-        input_dict['latent_dict']['latent'] = input_dict['latent_dict']['latent'].to(torch.bfloat16)
+        input_dict['latent_dict']['latent']        = input_dict['latent_dict']['latent'].to(torch.bfloat16)
         input_dict['action_dict']['noisy_latents'] = input_dict['action_dict']['noisy_latents'].to(torch.bfloat16)
-        input_dict['action_dict']['latent'] = input_dict['action_dict']['latent'].to(torch.bfloat16)
+        input_dict['action_dict']['latent']        = input_dict['action_dict']['latent'].to(torch.bfloat16)
 
         latent_dict = input_dict['latent_dict']
         action_dict = input_dict['action_dict']
-        batch_size = latent_dict['noisy_latents'].shape[0]
+        batch_size  = latent_dict['noisy_latents'].shape[0]
 
-        latent_hidden_states = self._input_embed(latent_dict['noisy_latents'], input_type='latent').flatten(0, 1)[None]
-        action_hidden_states = self._input_embed(action_dict['noisy_latents'], input_type='action').flatten(0, 1)[None]
-        text_hidden_states = self._input_embed(latent_dict["text_emb"], input_type='text')
+        # ── Embed inputs ──────────────────────────────────────────────────────
+        # Video stream: [B, L_v_noisy, dv] each, flattened to [1, B*L_v_noisy, dv]
+        lat_hs       = self._input_embed(latent_dict['noisy_latents'], 'latent').flatten(0, 1)[None]
+        cond_lat_hs  = self._input_embed(latent_dict['latent'],        'latent').flatten(0, 1)[None]
+        text_hs      = self._input_embed(latent_dict['text_emb'],      'text').flatten(0, 1)[None]
 
-        text_hidden_states = text_hidden_states.flatten(0, 1)[None]
+        # Action stream: [B, L_a_noisy, da=768] each, flattened to [1, B*L_a_noisy, da]
+        act_hs       = self._input_embed(action_dict['noisy_latents'], 'action').flatten(0, 1)[None]
+        cond_act_hs  = self._input_embed(action_dict['latent'],        'action').flatten(0, 1)[None]
 
-        condition_latent_hidden_states = self._input_embed(latent_dict['latent'], input_type='latent').flatten(0, 1)[None]
-        condition_action_hidden_states = self._input_embed(action_dict['latent'], input_type='action').flatten(0, 1)[None]
+        # Combined streams (separate tensors at different dims)
+        h_v = torch.cat([lat_hs, cond_lat_hs], dim=1)    # [1, L_v, dv=3072]
+        h_a = torch.cat([act_hs, cond_act_hs], dim=1)    # [1, L_a, da=768]
 
-        hidden_states = torch.cat([latent_hidden_states, 
-                                   condition_latent_hidden_states,
-                                   action_hidden_states, 
-                                   condition_action_hidden_states], dim=1)
+        L_v = h_v.shape[1]
+        L_a = h_a.shape[1]
 
+        # ── RoPE: separate grid_ids, combined for joint self-attention ────────
+        lat_grid  = latent_dict['grid_id'].permute(1, 0, 2).flatten(1)[None]   # [1, 3, B*L_v_noisy]
+        act_grid  = action_dict['grid_id'].permute(1, 0, 2).flatten(1)[None]   # [1, 3, B*L_a_noisy]
+        v_grid    = torch.cat([lat_grid] * 2, dim=2)                           # noisy + cond
+        a_grid    = torch.cat([act_grid] * 2, dim=2)
+        # Combined positional encodings for joint attention [L_v + L_a]
+        rotary_emb = self.rope(torch.cat([v_grid, a_grid], dim=2))[:, :, None]  # [1, L_v+L_a, 1, C]
 
-        latent_grid_id = latent_dict['grid_id'].permute(1, 0, 2).flatten(1)[None]
-        action_grid_id = action_dict['grid_id'].permute(1, 0, 2).flatten(1)[None]
-        full_grid_id = torch.cat([latent_grid_id] * 2 + [action_grid_id] * 2, dim=2)
+        # ── Time embeddings ───────────────────────────────────────────────────
+        lat_ts = torch.cat([latent_dict['timesteps'].flatten(0, 1),
+                            latent_dict['cond_timesteps'].flatten(0, 1)])[None]
+        act_ts = torch.cat([action_dict['timesteps'].flatten(0, 1),
+                            action_dict['cond_timesteps'].flatten(0, 1)])[None]
 
-        rotary_emb = self.rope(full_grid_id)[:, :, None] 
+        H_lat, W_lat = latent_dict['noisy_latents'].shape[-2:]
+        H_act, W_act = action_dict['noisy_latents'].shape[-2:]
 
-        latent_time_steps = torch.cat(
-            [latent_dict['timesteps'].flatten(0, 1), latent_dict['cond_timesteps'].flatten(0, 1)]
-        )[None]
-        action_time_steps = torch.cat(
-            [action_dict['timesteps'].flatten(0, 1), action_dict['cond_timesteps'].flatten(0, 1)]
-        )[None]
-        latent_temb, latent_timestep_proj =self._time_embed(latent_time_steps, 
-                        latent_dict['noisy_latents'].shape[-2], 
-                        latent_dict['noisy_latents'].shape[-1], 
-                        dtype=hidden_states.dtype, 
-                        action_mode=False)
-        action_temb, action_timestep_proj = self._time_embed(action_time_steps,
-                        action_dict['noisy_latents'].shape[-2], 
-                        action_dict['noisy_latents'].shape[-1], 
-                        dtype=hidden_states.dtype, 
-                        action_mode=True)
-        temb = torch.cat([latent_temb, action_temb], dim=1)
-        timestep_proj = torch.cat([latent_timestep_proj, action_timestep_proj], dim=1)
+        latent_temb, latent_ts_proj = self._time_embed(lat_ts, H_lat, W_lat,
+                                                        dtype=h_v.dtype, action_mode=False)
+        # latent_temb:    [1, L_v, dv=3072]   (used for final video output norm)
+        # latent_ts_proj: [1, L_v, 6, dv]     (block AdaLN)
 
-        total_length = hidden_states.shape[1]
-        padded_length = (128 - total_length % 128) % 128
-        hidden_states = F.pad(hidden_states, (0, 0, 0, padded_length))
-        rotary_emb = F.pad(rotary_emb, (0, 0, 0, 0, 0, padded_length))
-        temb = F.pad(temb, (0, 0, 0, padded_length))
-        timestep_proj = F.pad(timestep_proj, (0, 0, 0, 0, 0, padded_length))
+        action_temb, action_ts_proj = self._time_embed(act_ts, H_act, W_act,
+                                                        dtype=h_a.dtype, action_mode=True)
+        # action_temb:    [1, L_a, da=768]     (used for final action output norm)
+        # action_ts_proj: [1, L_a, 6, da=768]  (block action AdaLN)
 
-        split_list = [latent_hidden_states.shape[1], 
-                      condition_latent_hidden_states.shape[1], 
-                      action_hidden_states.shape[1], 
-                      condition_action_hidden_states.shape[1],
-                      padded_length]
-
-        FlexAttnFunc.init_mask(latent_dict['noisy_latents'].shape, 
-                               action_dict['noisy_latents'].shape, 
-                               padded_length, 
-                               input_dict["chunk_size"],
-                               window_size=input_dict['window_size'],
-                               patch_size=self.patch_size,
-                               device=hidden_states.device
-                               )
-
+        # ── Block loop: two-stream MoT ────────────────────────────────────────
         for block in self.blocks:
-            hidden_states = block(hidden_states,
-                                         text_hidden_states,
-                                         timestep_proj,
-                                         rotary_emb,
-                                         update_cache=False)
-        temb_scale_shift_table = self.scale_shift_table[None] + temb[:, :, None, ...]
-        shift, scale = rearrange(temb_scale_shift_table,
-                                 'b l n c -> b n l c').chunk(2, dim=1)
-        shift = shift.to(hidden_states.device).squeeze(1)
-        scale = scale.to(hidden_states.device).squeeze(1)
-        hidden_states = (self.norm_out(hidden_states.float()) *
-                                (1. + scale) +
-                                shift).type_as(hidden_states)
-        latent_hidden_states, _, action_hidden_states, _, _ = torch.split(hidden_states, split_list, dim=1)
-        latent_hidden_states = self.proj_out(latent_hidden_states)
-        latent_hidden_states = rearrange(latent_hidden_states,
-                                             '1 (b l) (n c) -> b (l n) c',
-                                             n=math.prod(self.patch_size), b=batch_size)  #
-        action_hidden_states = self.action_proj_out(action_hidden_states)
-        action_hidden_states = rearrange(action_hidden_states,
-                                             '1 (b l) c -> b l c',
-                                             b=batch_size)  #
+            h_v, h_a = block(h_v, text_hs, latent_ts_proj, rotary_emb,
+                             update_cache=False,
+                             action_states=h_a, temb_action=action_ts_proj)
 
-        return latent_hidden_states, action_hidden_states
+        # ── Video output norm + projection ────────────────────────────────────
+        sst_v = self.scale_shift_table[None] + latent_temb[:, :, None, ...]  # [1, L_v, 2, dv]
+        sh_v, sc_v = [x.squeeze(1) for x in
+                      rearrange(sst_v, 'b l n c -> b n l c').chunk(2, dim=1)]
+        h_v = (self.norm_out(h_v.float()) * (1. + sc_v) + sh_v).type_as(h_v)
+
+        L_v_noisy = lat_hs.shape[1]
+        latent_pred = self.proj_out(h_v[:, :L_v_noisy])
+        latent_pred = rearrange(latent_pred, '1 (b l) (n c) -> b (l n) c',
+                                n=math.prod(self.patch_size), b=batch_size)
+
+        # ── Action output norm + projection ───────────────────────────────────
+        sst_a = self.action_scale_shift_table_final[None] + action_temb[:, :, None, ...]  # [1, L_a, 2, da]
+        sh_a, sc_a = [x.squeeze(1) for x in
+                      rearrange(sst_a, 'b l n c -> b n l c').chunk(2, dim=1)]
+        h_a = (self.action_norm_out(h_a.float()) * (1. + sc_a) + sh_a).type_as(h_a)
+
+        L_a_noisy = act_hs.shape[1]
+        action_pred = self.action_proj_out(h_a[:, :L_a_noisy])
+        action_pred = rearrange(action_pred, '1 (b l) c -> b l c', b=batch_size)
+
+        return latent_pred, action_pred
 
     def forward(
         self,
@@ -858,28 +1190,35 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
         timestep_proj = timestep_proj.unflatten(2, (6, -1))  # B L 6 C
 
         for block in self.blocks:
-            latent_hidden_states = block(latent_hidden_states,
-                                         text_hidden_states,
-                                         timestep_proj,
-                                         rotary_emb,
-                                         update_cache=update_cache,
-                                         cache_name=cache_name)
-        temb_scale_shift_table = self.scale_shift_table[None] + temb[:, :, None, ...]
-        shift, scale = rearrange(temb_scale_shift_table,
-                                 'b l n c -> b n l c').chunk(2, dim=1)
-        shift = shift.to(latent_hidden_states.device).squeeze(1)
-        scale = scale.to(latent_hidden_states.device).squeeze(1)
-        latent_hidden_states = (self.norm_out(latent_hidden_states.float()) *
-                                (1. + scale) +
-                                shift).type_as(latent_hidden_states)
+            latent_hidden_states, _ = block(latent_hidden_states,
+                                            text_hidden_states,
+                                            timestep_proj,
+                                            rotary_emb,
+                                            update_cache=update_cache,
+                                            cache_name=cache_name,
+                                            action_only=action_mode)
 
         if action_mode:
+            # Action output norm + head at da=768
+            sst_a = self.action_scale_shift_table_final[None] + temb[:, :, None, ...]
+            shift_a, scale_a = rearrange(sst_a, 'b l n c -> b n l c').chunk(2, dim=1)
+            shift_a = shift_a.squeeze(1)
+            scale_a = scale_a.squeeze(1)
+            latent_hidden_states = (self.action_norm_out(latent_hidden_states.float()) *
+                                    (1. + scale_a) + shift_a).type_as(latent_hidden_states)
             latent_hidden_states = self.action_proj_out(latent_hidden_states)
         else:
+            # Video output norm + head at dv=3072
+            temb_scale_shift_table = self.scale_shift_table[None] + temb[:, :, None, ...]
+            shift, scale = rearrange(temb_scale_shift_table, 'b l n c -> b n l c').chunk(2, dim=1)
+            shift = shift.squeeze(1)
+            scale = scale.squeeze(1)
+            latent_hidden_states = (self.norm_out(latent_hidden_states.float()) *
+                                    (1. + scale) + shift).type_as(latent_hidden_states)
             latent_hidden_states = self.proj_out(latent_hidden_states)
             latent_hidden_states = rearrange(latent_hidden_states,
                                              'b l (n c) -> b (l n) c',
-                                             n=math.prod(self.patch_size))  #
+                                             n=math.prod(self.patch_size))
 
         return latent_hidden_states
 

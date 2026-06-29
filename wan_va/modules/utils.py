@@ -1,6 +1,5 @@
 # Copyright 2024-2025 The Robbyant Team Authors. All rights reserved.
 import torch
-from diffusers import AutoencoderKLWan
 from transformers import (
     T5TokenizerFast,
     UMT5EncoderModel,
@@ -14,6 +13,7 @@ def load_vae(
     torch_dtype,
     torch_device,
 ):
+    from diffusers import AutoencoderKLWan  # lazy: avoids flash_attn at import time
     vae = AutoencoderKLWan.from_pretrained(
         vae_path,
         torch_dtype=torch_dtype,
@@ -44,12 +44,34 @@ def load_transformer(
     torch_device,
     **kwargs
 ):
-    model = WanTransformer3DModel.from_pretrained(
-        transformer_path,
-        torch_dtype=torch_dtype,
-        **kwargs
-    )
+    import json, os
+    with open(os.path.join(transformer_path, "config.json")) as _f:
+        _class_name = json.load(_f).get("_class_name", "WanTransformer3DModel")
+
+    if _class_name == "WanMoTTransformer3DModel":
+        from .model_mot import WanMoTTransformer3DModel
+        model = WanMoTTransformer3DModel.from_pretrained(
+            transformer_path, torch_dtype=torch_dtype, **kwargs)
+    else:
+        model = WanTransformer3DModel.from_pretrained(
+            transformer_path, torch_dtype=torch_dtype, **kwargs)
+
+    # Materialize any meta tensors (e.g. newly-added action_ffn weights not in checkpoint).
+    _materialize_meta_tensors(model, dtype=torch_dtype)
     return model.to(torch_device)
+
+
+def _materialize_meta_tensors(model: torch.nn.Module, dtype=torch.float32) -> None:
+    """Replace meta-device parameters with zero-initialized tensors on CPU."""
+    with torch.no_grad():
+        for name, param in list(model.named_parameters()):
+            if param.is_meta:
+                parts = name.split(".")
+                mod = model
+                for part in parts[:-1]:
+                    mod = getattr(mod, part)
+                setattr(mod, parts[-1],
+                        torch.nn.Parameter(torch.zeros(param.shape, dtype=dtype, device="cpu")))
 
 
 def patchify(x, patch_size):

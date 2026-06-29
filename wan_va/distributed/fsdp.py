@@ -10,9 +10,10 @@ from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
 
 def apply_ac(model):
     """Apply activation checkpointing to the model."""
-    for layer_id, transformer_block in enumerate(model.blocks):
+    blocks = model.mot_blocks if hasattr(model, 'mot_blocks') else model.blocks
+    for layer_id, transformer_block in enumerate(blocks):
         transformer_block = ptd_checkpoint_wrapper(transformer_block, preserve_rng_state=False)
-        model.blocks[layer_id] = transformer_block
+        blocks[layer_id] = transformer_block
 
 
 def shard_model(model,
@@ -25,11 +26,21 @@ def shard_model(model,
     )
     fsdp_config = {"mp_policy": mp_policy, "reshard_after_forward": True}
 
-    for block in model.blocks:
-        fully_shard(block.attn1, **fsdp_config)
-        fully_shard(block.attn2, **fsdp_config)
-        fully_shard(block.ffn, **fsdp_config)
-        fully_shard(block, **fsdp_config)
+    if hasattr(model, 'mot_blocks'):
+        # WanMoTTransformer3DModel
+        for block in model.mot_blocks:
+            fully_shard(block.video_cross_attn, **fsdp_config)
+            fully_shard(block.video_ffn, **fsdp_config)
+            fully_shard(block.action_cross_attn, **fsdp_config)
+            fully_shard(block.action_ffn, **fsdp_config)
+            fully_shard(block, **fsdp_config)
+    else:
+        # WanTransformer3DModel (shared backbone)
+        for block in model.blocks:
+            fully_shard(block.attn1, **fsdp_config)
+            fully_shard(block.attn2, **fsdp_config)
+            fully_shard(block.ffn, **fsdp_config)
+            fully_shard(block, **fsdp_config)
 
     fully_shard(model, **fsdp_config)
     return model
