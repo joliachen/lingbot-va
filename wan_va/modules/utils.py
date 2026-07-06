@@ -53,12 +53,47 @@ def load_transformer(
         model = WanMoTTransformer3DModel.from_pretrained(
             transformer_path, torch_dtype=torch_dtype, **kwargs)
     else:
+        inferred_action_hidden_dim = _infer_action_hidden_dim(transformer_path)
+        if inferred_action_hidden_dim is not None:
+            kwargs.setdefault("action_hidden_dim", inferred_action_hidden_dim)
         model = WanTransformer3DModel.from_pretrained(
             transformer_path, torch_dtype=torch_dtype, **kwargs)
 
     # Materialize any meta tensors (e.g. newly-added action_ffn weights not in checkpoint).
     _materialize_meta_tensors(model, dtype=torch_dtype)
     return model.to(torch_device)
+
+
+def _infer_action_hidden_dim(transformer_path):
+    """Infer base action stream width from checkpoint weights when config omits it."""
+    import json
+    import os
+    from glob import glob
+
+    target_key = "action_embedder.bias"
+    shard_names = []
+    index_path = os.path.join(transformer_path,
+                              "diffusion_pytorch_model.safetensors.index.json")
+    if os.path.exists(index_path):
+        with open(index_path) as f:
+            weight_map = json.load(f).get("weight_map", {})
+        shard_name = weight_map.get(target_key)
+        if shard_name is not None:
+            shard_names.append(os.path.join(transformer_path, shard_name))
+
+    if not shard_names:
+        shard_names = sorted(glob(os.path.join(transformer_path, "*.safetensors")))
+
+    try:
+        from safetensors import safe_open
+    except Exception:
+        return None
+
+    for shard_path in shard_names:
+        with safe_open(shard_path, framework="pt", device="cpu") as f:
+            if target_key in f.keys():
+                return f.get_tensor(target_key).shape[0]
+    return None
 
 
 def _materialize_meta_tensors(model: torch.nn.Module, dtype=torch.float32) -> None:
