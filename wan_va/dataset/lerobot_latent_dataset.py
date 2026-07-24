@@ -156,12 +156,19 @@ class LatentLeRobotDataset(LeRobotDataset):
         self.parse_meta()
 
     def parse_meta(self):
+        # Optional single-task filter (e.g. for isolating one LIBERO-goal task
+        # to test whether multi-task interference, vs. something more basic,
+        # is behind a specific task's poor eval success rate). None (default)
+        # keeps existing all-tasks behavior unchanged.
+        task_filter = getattr(self.config, 'task_filter', None)
         out = []
         for key, value in self.meta.episodes.items():
             episode_index = value["episode_index"]
             tasks = value["tasks"]
             action_config = value["action_config"]
             for acfg in action_config:
+                if task_filter is not None and acfg.get('action_text') != task_filter:
+                    continue
                 cur_meta = {
                     "episode_index": episode_index,
                     "tasks": tasks,
@@ -176,6 +183,8 @@ class LatentLeRobotDataset(LeRobotDataset):
 
                 if check_statu:
                     out.append(cur_meta)
+        if task_filter is not None:
+            assert out, f"task_filter={task_filter!r} matched no episodes — check spelling against action_text"
         self.new_metas = out
 
     def _check_meta(self, start_frame, end_frame, episode_index):
@@ -243,7 +252,11 @@ class LatentLeRobotDataset(LeRobotDataset):
         else:
             cat_latent = torch.cat(latent_lst, dim=2)
 
-        text_emb = data_dict[f"{self.used_video_keys[0]}.text_emb"]
+        variants = data_dict.get(f"{self.used_video_keys[0]}.text_emb_variants", None)
+        if variants:
+            text_emb = variants[torch.randint(len(variants), (1,)).item()]
+        else:
+            text_emb = data_dict[f"{self.used_video_keys[0]}.text_emb"]
         if torch.rand(1).item() < self.cfg_prob:
             text_emb = self.empty_emb
 

@@ -12,6 +12,11 @@ from .va_libero_train_cfg import va_libero_train_cfg
 from .va_libero_i2va import va_libero_i2va_cfg
 from .va_libero_goal_object_cfg import va_libero_goal_object_cfg
 from .va_libero_goal_object_train_cfg import va_libero_goal_object_train_cfg
+from .va_libero_goal_mot_train_cfg import va_libero_goal_mot_train_cfg
+from .va_libero_wine_bottle_rack_mot_train_cfg import va_libero_wine_bottle_rack_mot_train_cfg
+from .va_libero_90_prompt_aug_mot_train_cfg import va_libero_90_prompt_aug_mot_train_cfg
+from .va_libero_long_cfg import va_libero_long_cfg
+from .va_libero_goal_shared_train_cfg import va_libero_goal_shared_train_cfg
 
 VA_CONFIGS = {
     'robotwin': va_robotwin_cfg,
@@ -27,4 +32,9 @@ VA_CONFIGS = {
     'libero_i2av': va_libero_i2va_cfg,
     'libero_goal_object': va_libero_goal_object_cfg,
     'libero_goal_object_train': va_libero_goal_object_train_cfg,
+    'libero_goal_mot_train': va_libero_goal_mot_train_cfg,
+    'libero_wine_bottle_rack_mot_train': va_libero_wine_bottle_rack_mot_train_cfg,
+    'libero_90_prompt_aug_mot_train': va_libero_90_prompt_aug_mot_train_cfg,
+    'libero_long': va_libero_long_cfg,
+    'libero_goal_shared_train': va_libero_goal_shared_train_cfg,
 }

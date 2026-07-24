@@ -26,17 +26,18 @@ def shard_model(model,
     )
     fsdp_config = {"mp_policy": mp_policy, "reshard_after_forward": True}
 
-    if hasattr(model, 'mot_blocks'):
-        # WanMoTTransformer3DModel
-        for block in model.mot_blocks:
-            fully_shard(block.video_cross_attn, **fsdp_config)
-            fully_shard(block.video_ffn, **fsdp_config)
-            fully_shard(block.action_cross_attn, **fsdp_config)
+    for block in model.blocks:
+        if hasattr(block, 'forward_joint'):
+            # WanMoTTransformerBlock: forward_joint reads all four attention
+            # modules' sub-layers directly (to_q/to_k/to_v/to_out), so their
+            # params must live in the block's own FSDP group — a separate
+            # fully_shard group would never unshard (no module call). Only
+            # module-called children (the FFNs) get their own groups.
+            fully_shard(block.ffn, **fsdp_config)
             fully_shard(block.action_ffn, **fsdp_config)
             fully_shard(block, **fsdp_config)
-    else:
-        # WanTransformer3DModel (shared backbone)
-        for block in model.blocks:
+        else:
+            # WanTransformer3DModel (shared backbone)
             fully_shard(block.attn1, **fsdp_config)
             fully_shard(block.attn2, **fsdp_config)
             fully_shard(block.ffn, **fsdp_config)

@@ -74,7 +74,7 @@ def env_one_step(env_in, action):
     return _extract_obs(obs), done
 
 
-def run_one(model, libero_benchmark, task_idx, out_dir, episode_idx):
+def run_one(model, libero_benchmark, task_idx, out_dir, episode_idx, open_loop=False, ground_action_kv=False):
     benchmark_dict = benchmark.get_benchmark_dict()
     benchmark_instance = benchmark_dict[libero_benchmark]()
     num_tasks = benchmark_instance.get_num_tasks()
@@ -96,8 +96,17 @@ def run_one(model, libero_benchmark, task_idx, out_dir, episode_idx):
     done = False
     first = True
     while cur_env.env.timestep < 800:
-        ret = model.infer(dict(obs=first_obs, prompt=prompt))
-        action = ret['action']
+        # Open-loop continuation chunks (first=False) don't need real obs —
+        # frame_st_id > 0 means _infer() ignores the obs argument entirely.
+        if open_loop and not first:
+            ret = model.infer(dict(prompt=prompt))
+        else:
+            ret = model.infer(dict(obs=first_obs, prompt=prompt))
+        # Clip to the env action range BEFORE execution so the actions fed back
+        # into the KV cache (state=action below) are exactly what the env ran;
+        # feeding unclipped predictions while the env executes clipped ones
+        # amplifies closed-loop cascade divergence.
+        action = np.clip(ret['action'], -1.0, 1.0)
 
         key_frame_list = []
         assert action.shape[2] % 4 == 0
@@ -120,6 +129,19 @@ def run_one(model, libero_benchmark, task_idx, out_dir, episode_idx):
 
         if done:
             break
+        elif open_loop and ground_action_kv:
+            # Hybrid: video branch stays self-imagined (imagine=True), but the
+            # action branch is grounded with the REAL executed action (state=
+            # action) — isolates whether real-action feedback alone, with no
+            # visual feedback, stabilizes the rollout.
+            model.infer(dict(compute_kv_cache=True, imagine=True, state=action))
+        elif open_loop:
+            # Self-conditioned continuation: advance the cache using the
+            # model's own last chunk (imagine=True), never the real obs/action
+            # just executed above — the env is driven blind throughout, but
+            # the predicted video/action stream keeps chaining forward for as
+            # many chunks as closed-loop would run, instead of stopping at 1.
+            model.infer(dict(compute_kv_cache=True, imagine=True))
         else:
             model.infer(dict(obs=key_frame_list, compute_kv_cache=True, imagine=False, state=action))
 
@@ -137,7 +159,7 @@ def run_one(model, libero_benchmark, task_idx, out_dir, episode_idx):
     return done
 
 
-def run(libero_benchmark, port, out_dir, test_num, task_range=None):
+def run(libero_benchmark, port, out_dir, test_num, task_range=None, open_loop=False, ground_action_kv=False):
     '''
         task_range: [start, end) for splitting tasks
     '''
@@ -167,7 +189,7 @@ def run(libero_benchmark, port, out_dir, test_num, task_range=None):
             succ_num = 0.
 
         for episode_idx in tqdm(episode_list, total=len(episode_list)):
-            res_i = run_one(model, libero_benchmark, task_idx, out_dir, episode_idx)
+            res_i = run_one(model, libero_benchmark, task_idx, out_dir, episode_idx, open_loop=open_loop, ground_action_kv=ground_action_kv)
             succ_num += res_i
             succ_rate = succ_num / (episode_idx + 1)
             print(f"Success rate: {succ_rate}, success num: {succ_num}, total num: {episode_idx + 1}")
@@ -214,6 +236,23 @@ def main():
         type=str,
         default="outputs/libero",
         help="Output directory for results",
+    )
+    parser.add_argument(
+        "--open-loop",
+        action="store_true",
+        help="Blind rollout: each chunk's KV-cache advance is self-conditioned "
+             "on the model's own last generated latents/actions (imagine=True) "
+             "instead of real observations, chaining forward chunk-after-chunk "
+             "like closed-loop but with zero real-observation feedback. The env "
+             "is still driven by whatever actions come out, for the real video.",
+    )
+    parser.add_argument(
+        "--ground-action-kv",
+        action="store_true",
+        help="Only valid with --open-loop. Feeds the REAL executed action into "
+             "the action-branch KV cache (like closed-loop) while the video "
+             "branch stays self-imagined — isolates whether real-action "
+             "feedback alone (no visual feedback) stabilizes the rollout.",
     )
     args = parser.parse_args()
     run(**vars(args))

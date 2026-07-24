@@ -7,7 +7,7 @@ va_libero_goal_object_train_cfg = EasyDict(__name__='Config: VA LIBERO Goal+Obje
 va_libero_goal_object_train_cfg.update(va_libero_goal_object_cfg)
 
 va_libero_goal_object_train_cfg.dataset_path = \
-    '/home/jolia/robot-icl/data/libero_goal_object_lerobot'
+    '/scratch/zc2745/robot-icl/data/libero_goal_object_lerobot'
 va_libero_goal_object_train_cfg.empty_emb_path = os.path.join(
     va_libero_goal_object_train_cfg.dataset_path, 'empty_emb.pt')
 
@@ -30,6 +30,7 @@ va_libero_goal_object_train_cfg.gradient_accumulation_steps = 4
 va_libero_goal_object_train_cfg.num_steps      = 2000
 va_libero_goal_object_train_cfg.sequence_length = 100000
 
-# Freeze video backbone; train only action_ffn / action_norm3 / action_scale_shift_table.
-# Required to fit training in 32 GB VRAM on a single RTX 5090.
+# Freeze video backbone; train the full action stream (action_attn1/2, action_ffn,
+# norms, modulation tables, embedder/head) — 5.0B of 10.0B params. AdamW states
+# for 5B params need ~40 GB fp32: plan for an H200-class GPU.
 va_libero_goal_object_train_cfg.freeze_backbone = True

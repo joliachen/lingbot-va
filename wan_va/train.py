@@ -75,8 +75,9 @@ class Trainer:
                 # dir=log_dir,
                 config=config,
                 mode="online",
-                name='test_lln'
-                # name=os.path.basename(os.path.normpath(job_config.job.dump_folder))
+                name=os.getenv(
+                    "WANDB_RUN_NAME",
+                    os.path.basename(os.path.normpath(getattr(config, 'save_root', 'run'))))
             )
             logger.info("WandB logging enabled")
         self.step = 0
@@ -110,7 +111,9 @@ class Trainer:
         # (c) loading a pre-converted MoT checkpoint (action_ffn weights already non-random).
         use_mot = getattr(config, 'use_mot_action_expert', False)
         is_resume = hasattr(config, 'resume_from') and config.resume_from
-        action_expert_already_init = _action_expert_is_initialised(self.transformer)
+        # Only probe action_ffn on MoT models — the plain shared backbone
+        # (WanTransformer3DModel, e.g. lingbot-va-base) has no action_ffn.
+        action_expert_already_init = use_mot and _action_expert_is_initialised(self.transformer)
         if use_mot and not is_resume and not action_expert_already_init:
             logger.info("Initialising Action Expert FFN from video weights (MoT copy-init)...")
             self.transformer.init_action_expert_from_video()

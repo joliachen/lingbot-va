@@ -135,9 +135,16 @@ class VA_Server:
                                           mask.to(text_encoder_device)).last_hidden_state
         prompt_embeds = prompt_embeds.to(dtype=dtype, device=device)
         prompt_embeds = [u[:v] for u, v in zip(prompt_embeds, seq_lens)]
+        # Pad only to the true-length max WITHIN this batch (not to
+        # max_sequence_length=512). Posttraining stored text_emb trimmed to
+        # real seq_len (scripts/extract_latents.py) with no 512 padding, so
+        # re-padding to 512 here put every finetuned rollout on ~500 unseen
+        # zero-pad tokens (see memory/text-padding-mismatch.md) — this keeps
+        # inference in the distribution the finetune actually trained on.
+        pad_len = max(u.size(0) for u in prompt_embeds)
         prompt_embeds = torch.stack([
             torch.cat(
-                [u, u.new_zeros(max_sequence_length - u.size(0), u.size(1))])
+                [u, u.new_zeros(pad_len - u.size(0), u.size(1))])
             for u in prompt_embeds
         ],
                                     dim=0)
@@ -206,6 +213,22 @@ class VA_Server:
                 device=device,
                 dtype=dtype,
             )
+            # prompt_embeds / negative_prompt_embeds are each trimmed to their
+            # own true length now (no more shared 512 padding), so the two
+            # branches can disagree in seq_len (e.g. a 9-token prompt vs a
+            # 1-token empty uncond) — pad the shorter to the longer so the
+            # cond/uncond torch.cat(dim=0) callers downstream still work.
+            # This mirrors training: the uncond sample only ever appended
+            # zero rows past its own real content, never truncated the cond
+            # side, so we extend the empty embedding rather than cut the prompt.
+            common_len = max(prompt_embeds.shape[1], negative_prompt_embeds.shape[1])
+            def _pad_seq(t, length):
+                if t.shape[1] == length:
+                    return t
+                pad = t.new_zeros(t.shape[0], length - t.shape[1], t.shape[2])
+                return torch.cat([t, pad], dim=1)
+            prompt_embeds = _pad_seq(prompt_embeds, common_len)
+            negative_prompt_embeds = _pad_seq(negative_prompt_embeds, common_len)
         return prompt_embeds, negative_prompt_embeds
 
     def normalize_latents(
@@ -237,6 +260,10 @@ class VA_Server:
                 self.actions_q99 - self.actions_q01 + 1e-6) * 2. - 1.
         else:
             raise NotImplementedError
+        # Zero out unused channels to match training: the dataset multiplies by
+        # action_mask after normalization, so masked dims are 0 there — without
+        # this, zero-range quantiles map them to -1 in the KV-cache state.
+        action_model_input[~self.action_mask] = 0.
         return action_model_input.unsqueeze(0).unsqueeze(-1)  # B, C, F, H, W
 
     def postprocess_action(self, action):
@@ -380,6 +407,8 @@ class VA_Server:
         #### Reset all parameters
         self.frame_st_id = 0
         self.init_latent = None
+        self._last_latents = None
+        self._last_actions_normalized = None
         #### clean vae and transformer cache
         self.transformer.clear_cache(self.cache_name)
         self.streaming_vae.clear_cache()
@@ -565,6 +594,13 @@ class VA_Server:
         save_async(latents, os.path.join(self.exp_save_root, f'latents_{frame_st_id}.pt'))
         save_async(actions, os.path.join(self.exp_save_root, f'actions_{frame_st_id}.pt'))
 
+        # Kept for open-loop self-conditioned continuation (_compute_kv_cache
+        # with imagine=True) — the model's own last chunk, in the same
+        # normalized latent/action space _encode_obs/preprocess_action would
+        # otherwise produce from a real observation.
+        self._last_latents = latents
+        self._last_actions_normalized = actions
+
         actions = self.postprocess_action(actions)
         torch.cuda.empty_cache()
         return actions, latents
@@ -572,15 +608,37 @@ class VA_Server:
     def _compute_kv_cache(self, obs):
         ### optional async save obs for debug
         self.transformer.clear_pred_cache(self.cache_name)
-        save_async(obs['obs'], os.path.join(self.exp_save_root, f'obs_data_{self.frame_st_id}.pt'))
-        latent_model_input = self._encode_obs(obs)
-        if self.frame_st_id == 0:
-            latent_model_input = torch.cat(
-                [self.init_latent, latent_model_input],
-                dim=2) if latent_model_input is not None else self.init_latent
+        imagine = obs.get('imagine', False)
+        if imagine:
+            # Open-loop self-conditioned continuation: commit the model's own
+            # last generated chunk as "confirmed" history instead of a real
+            # env observation, so subsequent _infer() calls keep advancing
+            # frame_st_id and attending to a purely self-imagined past — no
+            # real observation is ever used.
+            latent_model_input = self._last_latents
+            if self.frame_st_id == 0:
+                latent_model_input = torch.cat(
+                    [self.init_latent, latent_model_input],
+                    dim=2) if latent_model_input is not None else self.init_latent
+            if 'state' in obs:
+                # Action-grounded open-loop: the action branch is fed the
+                # REAL executed action (like closed-loop), while the video
+                # branch stays self-imagined — isolates whether real-action
+                # feedback alone (no visual feedback) stabilizes the rollout.
+                action_model_input = self.preprocess_action(obs['state'])
+                action_model_input = action_model_input.to(latent_model_input)
+            else:
+                action_model_input = self._last_actions_normalized.to(latent_model_input)
+        else:
+            save_async(obs['obs'], os.path.join(self.exp_save_root, f'obs_data_{self.frame_st_id}.pt'))
+            latent_model_input = self._encode_obs(obs)
+            if self.frame_st_id == 0:
+                latent_model_input = torch.cat(
+                    [self.init_latent, latent_model_input],
+                    dim=2) if latent_model_input is not None else self.init_latent
 
-        action_model_input = self.preprocess_action(obs['state'])
-        action_model_input = action_model_input.to(latent_model_input)
+            action_model_input = self.preprocess_action(obs['state'])
+            action_model_input = action_model_input.to(latent_model_input)
         logger.info(
             f"get KV cache obs: {latent_model_input.shape} {action_model_input.shape}"
         )
@@ -680,6 +738,12 @@ def run(args):
     port = config.port if args.port is None else args.port
     if args.save_root is not None:
         config.save_root = args.save_root
+    if getattr(args, 'checkpoint_path', None):
+        config.wan22_pretrained_model_name_or_path = args.checkpoint_path
+    if getattr(args, 'video_cfg_scale', None) is not None:
+        config.guidance_scale = args.video_cfg_scale
+    if getattr(args, 'action_cfg_scale', None) is not None:
+        config.action_guidance_scale = args.action_cfg_scale
     rank = int(os.getenv("RANK", 0))
     local_rank = int(os.environ.get('LOCAL_RANK', 0))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
@@ -720,6 +784,25 @@ def main():
         type=str,
         default=None,
         help='save root'
+    )
+    parser.add_argument(
+        "--checkpoint-path",
+        type=str,
+        default=None,
+        help='override config.wan22_pretrained_model_name_or_path '
+             '(dir with transformer/ vae/ text_encoder/ tokenizer/)'
+    )
+    parser.add_argument(
+        "--video-cfg-scale",
+        type=float,
+        default=None,
+        help='override config.guidance_scale (video/world-model branch CFG scale)'
+    )
+    parser.add_argument(
+        "--action-cfg-scale",
+        type=float,
+        default=None,
+        help='override config.action_guidance_scale (action branch CFG scale)'
     )
     args = parser.parse_args()
     run(args)

@@ -5,8 +5,11 @@ from .va_libero_cfg import va_libero_cfg
 va_libero_goal_object_cfg = EasyDict(__name__='Config: VA LIBERO Goal+Object')
 va_libero_goal_object_cfg.update(va_libero_cfg)
 
+# Converted MoT checkpoint (full layout: transformer/ + vae/ + text_encoder/ +
+# tokenizer/). For eval of a fine-tuned run, point at a checkpoint dir with the
+# same layout (train_mot saves transformer/ only — symlink the rest from here).
 va_libero_goal_object_cfg.wan22_pretrained_model_name_or_path = \
-    '/home/jolia/robot-icl/checkpoints/lingbot-va-base'
+    '/scratch/zc2745/robot-icl/checkpoints/lingbot-va-mot-posttrain-libero-goal-gradaccum43'
 
 va_libero_goal_object_cfg.attn_window      = 72
 va_libero_goal_object_cfg.frame_chunk_size = 4

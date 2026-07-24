@@ -78,6 +78,7 @@ from .model import (
     WanRotaryPosEmbed,
     WanTimeTextImageEmbedding,
     FlexAttnFunc,
+    custom_sdpa,
 )
 
 __all__ = ['WanMoTTransformer3DModel']
@@ -153,6 +154,28 @@ class WanMoTTransformerBlock(nn.Module):
         tbl = scale_shift_table[None] + temb.float()
         parts = rearrange(tbl, 'b l n c -> b n l c').chunk(6, dim=1)
         return [p.squeeze(1) for p in parts]
+
+    # FSDP2 pre-forward (unshard) and activation-checkpointing hooks only fire
+    # on __call__ — forward_train must invoke the block, not forward_joint
+    # directly, or sharded DTensor params leak into plain-tensor math.
+    def forward(self, *args, **kwargs):
+        return self.forward_joint(*args, **kwargs)
+
+    @staticmethod
+    def _cross_attn_sdpa(attn, x, context):
+        """Text cross-attention over exact-length (unpadded) text tokens.
+
+        FlexAttnFunc.cross_attention_mask is built for the shared-backbone
+        layout (full concatenated video+action sequence x 512 padded text
+        tokens); forward_joint cross-attends the two streams separately with
+        unpadded text, where masking (batch=1, no text padding) degenerates
+        to full attention — plain SDPA is exact.
+        """
+        q = attn.norm_q(attn.to_q(x)).unflatten(2, (attn.heads, -1))
+        k = attn.norm_k(attn.to_k(context)).unflatten(2, (attn.heads, -1))
+        v = attn.to_v(context).unflatten(2, (attn.heads, -1))
+        out = custom_sdpa(q, k, v).flatten(2, 3).type_as(x)
+        return attn.to_out[1](attn.to_out[0](out))
 
     # ── training: joint cross-modal forward (video || action concatenated) ─
     def forward_joint(
@@ -267,14 +290,12 @@ class WanMoTTransformerBlock(nn.Module):
         # FlexAttnFunc.cross_attention_mask internally — same mechanism as
         # the shared backbone's cross-attention, no extra wiring needed here.
         norm_v2 = self.norm2(video_states.float()).type_as(video_states)
-        video_states = video_states + self.attn2(
-            norm_v2, encoder_hidden_states, encoder_hidden_states, None,
-            update_cache=0)
+        video_states = video_states + self._cross_attn_sdpa(
+            self.attn2, norm_v2, encoder_hidden_states)
 
         norm_a2 = self.action_norm2(action_states.float()).type_as(action_states)
-        action_states = action_states + self.action_attn2(
-            norm_a2, encoder_hidden_states, encoder_hidden_states, None,
-            update_cache=0)
+        action_states = action_states + self._cross_attn_sdpa(
+            self.action_attn2, norm_a2, encoder_hidden_states)
 
         # ── FFN — separate per stream, both d_v-sized ───────────────────────
         norm_v3 = (self.norm3(video_states.float()) * (1. + c_sc_v) + c_sh_v).type_as(video_states)
@@ -504,6 +525,11 @@ class WanMoTTransformer3DModel(ModelMixin, ConfigMixin):
         latent_dict = input_dict['latent_dict']
         action_dict = input_dict['action_dict']
         batch_size  = latent_dict['noisy_latents'].shape[0]
+        # _cross_attn_sdpa runs UNMASKED over exact-length text — only valid
+        # when the flat sequence holds a single sample (no cross-sample leak).
+        assert batch_size == 1, (
+            'forward_train cross-attention assumes batch_size=1 per rank; '
+            'multi-sample packing needs a per-sample cross mask')
 
         # ── embed ────────────────────────────────────────────────────────
         v_noise = self._video_embed(latent_dict['noisy_latents']).flatten(0, 1)[None]
@@ -563,7 +589,9 @@ class WanMoTTransformer3DModel(ModelMixin, ConfigMixin):
 
         # ── block loop ──────────────────────────────────────────────────
         for block in self.blocks:
-            video_states, action_states = block.forward_joint(
+            # Module call (NOT block.forward_joint) so FSDP unshard and
+            # activation-checkpointing wrappers actually engage.
+            video_states, action_states = block(
                 video_states, action_states, text_hs,
                 latent_tproj, action_tproj, rotary_emb,
             )

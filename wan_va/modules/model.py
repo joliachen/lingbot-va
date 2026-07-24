@@ -142,7 +142,93 @@ class FlexAttnFunc(nn.Module):
                 mask_mod_cross, 1, 1, len(seq_ids), len(text_seq_ids), device=device, _compile=True
             )
         FlexAttnFunc.cross_attention_mask = block_mask_cross
-    
+
+    @staticmethod
+    @torch.no_grad()
+    def init_mask_packed(
+        latent_shapes,
+        action_shapes,
+        text_lens,
+        padded_length,
+        chunk_size,
+        window_size,
+        patch_size,
+        device,
+    ):
+        """Packing-aware sibling of init_mask: builds seq_ids/frame_ids/noise_ids/
+        text_seq_ids by torch.cat-ing N independent, variable-length episodes
+        instead of .expand()-ing a single uniform-shape (B,C,F,H,W) tensor over a
+        batch dimension. Episode i gets seq id i for both self- and cross-
+        attention (blocking any cross-episode attention, same mechanism as
+        init_mask's batch-index seq_ids); text_seq_ids uses each episode's REAL
+        (trimmed, unpadded) text length instead of the hardcoded 512 init_mask
+        assumes, since this project's dataset stores trimmed text embeddings
+        (see text-padding-mismatch project memory — reintroducing 512-padded text
+        here would resurrect that already-diagnosed regression).
+        _get_mask_mod / _get_cross_mask_mod are reused UNMODIFIED — they already
+        operate purely on flat seq_ids/frame_ids/noise_ids/text_seq_ids arrays
+        with no assumption beyond "1-D array indexed by flat position".
+        """
+        torch._inductor.config.realize_opcount_threshold = 100
+        pf, ph, pw = patch_size
+        n = len(latent_shapes)
+        assert len(action_shapes) == n and len(text_lens) == n
+
+        lat_seq_parts, lat_frame_parts, lat_noise_parts = [], [], []
+        act_seq_parts, act_frame_parts, act_noise_parts = [], [], []
+        text_seq_parts = []
+
+        for i in range(n):
+            _, _, L_F, L_H, L_W = latent_shapes[i]
+            _, _, A_F, A_H, A_W = action_shapes[i]
+
+            latent_frame_id = torch.arange(L_F)[:, None, None].expand(
+                -1, L_H // ph, L_W // pw).flatten()
+            action_frame_id = torch.arange(A_F)[:, None, None].expand(
+                -1, A_H, A_W).flatten()
+            n_lat, n_act = latent_frame_id.numel(), action_frame_id.numel()
+
+            # episode-major: noise half then cond half, SAME episode id and
+            # SAME frame_id array reused for both — mirrors init_mask's [x]*2
+            lat_seq_parts.append(torch.full((2 * n_lat,), i, dtype=torch.long))
+            lat_frame_parts.append(torch.cat([latent_frame_id, latent_frame_id]))
+            lat_noise_parts.append(torch.cat([torch.zeros(n_lat), torch.ones(n_lat)]))
+
+            act_seq_parts.append(torch.full((2 * n_act,), i, dtype=torch.long))
+            act_frame_parts.append(torch.cat([action_frame_id, action_frame_id]))
+            act_noise_parts.append(torch.cat([torch.zeros(n_act), torch.ones(n_act)]))
+
+            text_seq_parts.append(torch.full((text_lens[i],), i, dtype=torch.long))
+
+        lat_seq = torch.cat(lat_seq_parts)
+        lat_frame = torch.cat(lat_frame_parts)
+        lat_noise = torch.cat(lat_noise_parts)
+        act_seq = torch.cat(act_seq_parts)
+        act_frame = torch.cat(act_frame_parts)
+        act_noise = torch.cat(act_noise_parts)
+
+        seq_ids = torch.cat([lat_seq, act_seq])
+        frame_ids = torch.cat([lat_frame.long() // chunk_size * 2,
+                               act_frame.long() // chunk_size * 2 + 1])
+        noise_ids = torch.cat([lat_noise, act_noise]).long()
+
+        seq_ids = F.pad(seq_ids, (0, padded_length), value=-1)
+        frame_ids = F.pad(frame_ids, (0, padded_length), value=-1)
+        noise_ids = F.pad(noise_ids, (0, padded_length), value=-1)
+
+        mask_mod = FlexAttnFunc._get_mask_mod(seq_ids.long().to(device), frame_ids.long().to(device), noise_ids.long().to(device), window_size)
+        block_mask = FlexAttnFunc.compiled_create_block_mask(
+                mask_mod, 1, 1, len(seq_ids), len(seq_ids), device=device, _compile=True
+            )
+        FlexAttnFunc.attention_mask = block_mask
+
+        text_seq_ids = torch.cat(text_seq_parts)   # real per-episode length, no 512-pad
+        mask_mod_cross = FlexAttnFunc._get_cross_mask_mod(seq_ids.long().to(device), text_seq_ids.long().to(device))
+        block_mask_cross = FlexAttnFunc.compiled_create_block_mask(
+                mask_mod_cross, 1, 1, len(seq_ids), len(text_seq_ids), device=device, _compile=True
+            )
+        FlexAttnFunc.cross_attention_mask = block_mask_cross
+
     @staticmethod
     @torch.no_grad()
     def _get_cross_mask_mod(seq_ids, text_seq_ids):
