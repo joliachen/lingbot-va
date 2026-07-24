@@ -165,11 +165,20 @@ class WanMoTTransformerBlock(nn.Module):
     def _cross_attn_sdpa(attn, x, context):
         """Text cross-attention over exact-length (unpadded) text tokens.
 
-        FlexAttnFunc.cross_attention_mask is built for the shared-backbone
-        layout (full concatenated video+action sequence x 512 padded text
-        tokens); forward_joint cross-attends the two streams separately with
-        unpadded text, where masking (batch=1, no text padding) degenerates
-        to full attention — plain SDPA is exact.
+        Used by the SINGLE-EPISODE (unpacked) training contract only
+        (forward_joint's packed=False path, the default). In that contract
+        FlexAttnFunc.cross_attention_mask is whatever the shared-backbone-style
+        init_mask() last built (512-padded-text layout) — NOT compatible with
+        our exact-length text — so this bypasses it entirely: with batch=1 and
+        one episode's worth of unpadded text, "no mask" and "attend only this
+        episode's text" are the same thing, making plain SDPA exact. Do NOT
+        use this for the packed (multi-episode) contract — see
+        WanMoTTransformer3DModel._forward_train_packed, which instead routes
+        through attn/action_attn's normal WanAttention.forward() so the real,
+        variable-length FlexAttnFunc.cross_attention_mask built by
+        FlexAttnFunc.init_mask_packed (real per-episode text length, no
+        512-pad) applies and keeps each packed episode's tokens from
+        cross-attending into a different episode's text.
         """
         q = attn.norm_q(attn.to_q(x)).unflatten(2, (attn.heads, -1))
         k = attn.norm_k(attn.to_k(context)).unflatten(2, (attn.heads, -1))
@@ -186,6 +195,7 @@ class WanMoTTransformerBlock(nn.Module):
         video_temb: torch.Tensor,             # (1, L_v, 6, d_v)
         action_temb: torch.Tensor,            # (1, L_a, 6, d_v)
         rotary_emb: torch.Tensor,             # (1, L_v+L_a, 1, head_dim)
+        packed: bool = False,                 # True: multi-episode packed contract
     ):
         """
         Used by forward_train(). No KV cache is used here — the whole episode
@@ -284,18 +294,30 @@ class WanMoTTransformerBlock(nn.Module):
         action_states = (action_states.float() + out_a.float() * g_a).type_as(action_states)
 
         # ── cross-attention with text — both streams in d_v, no projection ──
-        # self.attn2 / self.action_attn2 here go through WanAttention.forward()
-        # UNMODIFIED (unlike self-attention above), so when attn_mode='flex'
-        # their attn_op is FlexAttnFunc(is_cross=True), which reads
-        # FlexAttnFunc.cross_attention_mask internally — same mechanism as
-        # the shared backbone's cross-attention, no extra wiring needed here.
+        # packed=False (single-episode contract, unchanged): _cross_attn_sdpa,
+        # plain unmasked SDPA — exact when there's one episode's unpadded text
+        # and no cross-episode risk (see _cross_attn_sdpa's docstring).
+        # packed=True (multi-episode contract): route through attn2/action_attn2's
+        # normal WanAttention.forward() UNMODIFIED, exactly as forward_video/
+        # forward_action already do at inference. When attn_mode='flex' their
+        # attn_op is FlexAttnFunc(is_cross=True), which reads the class-level
+        # FlexAttnFunc.cross_attention_mask internally — built per packed-forward
+        # call by FlexAttnFunc.init_mask_packed (real per-episode text length,
+        # no 512-pad), which keeps each episode's tokens attending only to
+        # THEIR OWN episode's text. Using _cross_attn_sdpa here instead would
+        # silently let every packed episode attend every other episode's text.
         norm_v2 = self.norm2(video_states.float()).type_as(video_states)
-        video_states = video_states + self._cross_attn_sdpa(
-            self.attn2, norm_v2, encoder_hidden_states)
-
         norm_a2 = self.action_norm2(action_states.float()).type_as(action_states)
-        action_states = action_states + self._cross_attn_sdpa(
-            self.action_attn2, norm_a2, encoder_hidden_states)
+        if packed:
+            video_states = video_states + self.attn2(
+                norm_v2, encoder_hidden_states, encoder_hidden_states, None)
+            action_states = action_states + self.action_attn2(
+                norm_a2, encoder_hidden_states, encoder_hidden_states, None)
+        else:
+            video_states = video_states + self._cross_attn_sdpa(
+                self.attn2, norm_v2, encoder_hidden_states)
+            action_states = action_states + self._cross_attn_sdpa(
+                self.action_attn2, norm_a2, encoder_hidden_states)
 
         # ── FFN — separate per stream, both d_v-sized ───────────────────────
         norm_v3 = (self.norm3(video_states.float()) * (1. + c_sc_v) + c_sh_v).type_as(video_states)
@@ -516,7 +538,19 @@ class WanMoTTransformer3DModel(ModelMixin, ConfigMixin):
         return temb, timestep_proj
 
     # ── training forward ─────────────────────────────────────────────────
+    # Two input contracts, dispatched on the presence of 'episodes':
+    #   single-episode (default, unchanged): input_dict has 'latent_dict'/
+    #     'action_dict' directly, batch_size==1, forward_joint(packed=False).
+    #   packed (multi-episode): input_dict['episodes'] is a list of
+    #     {'latent_dict','action_dict'} dicts (same per-episode shapes/keys as
+    #     above), handled by _forward_train_packed below. A pack of exactly
+    #     one episode is required to reduce to numerically the same result as
+    #     the single-episode path (mask/rope/cross-attn all specialize
+    #     correctly at N=1) — this is the correctness invariant checked by
+    #     discard/scripts_diagnostics/verify_packed_forward_train.py.
     def forward_train(self, input_dict):
+        if 'episodes' in input_dict:
+            return self._forward_train_packed(input_dict)
         input_dict['latent_dict']['noisy_latents'] = input_dict['latent_dict']['noisy_latents'].to(torch.bfloat16)
         input_dict['latent_dict']['latent']        = input_dict['latent_dict']['latent'].to(torch.bfloat16)
         input_dict['action_dict']['noisy_latents'] = input_dict['action_dict']['noisy_latents'].to(torch.bfloat16)
@@ -625,6 +659,183 @@ class WanMoTTransformer3DModel(ModelMixin, ConfigMixin):
         a_out = rearrange(a_out, '1 (b l) c -> b l c', b=batch_size)
 
         return v_out, a_out
+
+    # ── training forward: PACKED (multi-episode) contract ──────────────────
+    # Real episode packing (replaces the gradient_accumulation_steps=43
+    # token-budget workaround): N episodes are embedded independently, then
+    # concatenated EPISODE-MAJOR into one joint forward pass — [ep0 noise,
+    # ep0 cond, ep1 noise, ep1 cond, ...] for both the video and action
+    # streams (each stream's own [noise,cond] pair stays adjacent, exactly
+    # matching what _time_embed already produces per-episode, so no
+    # split/regroup of timestep-projections is needed — just concatenation).
+    # Self-attention across the whole pack is scoped to same-episode pairs by
+    # FlexAttnFunc.init_mask_packed's per-token seq_ids (identical mechanism
+    # to the single-episode path's init_mask, just built by torch.cat over
+    # variable-length episodes instead of .expand() over a batch dim). Text
+    # cross-attention uses the REAL per-episode (trimmed) text length via the
+    # same mask machinery — see forward_joint(packed=True) and
+    # FlexAttnFunc.init_mask_packed's docstring for why this must NOT use the
+    # 512-padded-text convention. The block loop itself is UNCHANGED (module
+    # __call__, not forward_joint directly — FSDP unshard / activation-
+    # checkpointing hooks only fire on __call__, same requirement as the
+    # single-episode path, see the comment on WanMoTTransformerBlock.forward
+    # above); the per-episode Python loop below only touches top-level,
+    # whole-model-FSDP-group-resident modules (patch_embedding_mlp,
+    # action_embedder, condition_embedder(_action), rope) BEFORE the block
+    # loop runs, so it adds no extra unshard/reshard traffic.
+    def _forward_train_packed(self, input_dict):
+        episodes = input_dict['episodes']
+        n = len(episodes)
+        assert n >= 1, '_forward_train_packed requires at least one episode'
+
+        v_noise_l, v_cond_l, a_noise_l, a_cond_l = [], [], [], []
+        text_l = []
+        lat_temb_l, lat_tproj_l, act_temb_l, act_tproj_l = [], [], [], []
+        lat_grid_l, act_grid_l = [], []
+        lat_shapes, act_shapes, text_lens = [], [], []
+        L_v_noise, L_v_cond, L_a_noise, L_a_cond = [], [], [], []
+
+        for ep in episodes:
+            latent_dict = ep['latent_dict']
+            action_dict = ep['action_dict']
+            assert latent_dict['noisy_latents'].shape[0] == 1, (
+                '_forward_train_packed processes one episode (batch=1) per '
+                'pack member; multi-sample-per-episode packing is not supported')
+
+            latent_dict['noisy_latents'] = latent_dict['noisy_latents'].to(torch.bfloat16)
+            latent_dict['latent']        = latent_dict['latent'].to(torch.bfloat16)
+            action_dict['noisy_latents'] = action_dict['noisy_latents'].to(torch.bfloat16)
+            action_dict['latent']        = action_dict['latent'].to(torch.bfloat16)
+
+            v_noise = self._video_embed(latent_dict['noisy_latents']).flatten(0, 1)[None]
+            v_cond  = self._video_embed(latent_dict['latent']).flatten(0, 1)[None]
+            a_noise = self._action_embed(action_dict['noisy_latents']).flatten(0, 1)[None]
+            a_cond  = self._action_embed(action_dict['latent']).flatten(0, 1)[None]
+            text_hs = self.condition_embedder.text_embedder(
+                latent_dict["text_emb"]).flatten(0, 1)[None]
+
+            v_noise_l.append(v_noise); v_cond_l.append(v_cond)
+            a_noise_l.append(a_noise); a_cond_l.append(a_cond)
+            text_l.append(text_hs)
+            L_v_noise.append(v_noise.shape[1]); L_v_cond.append(v_cond.shape[1])
+            L_a_noise.append(a_noise.shape[1]); L_a_cond.append(a_cond.shape[1])
+            text_lens.append(text_hs.shape[1])
+            lat_shapes.append(tuple(latent_dict['noisy_latents'].shape))
+            act_shapes.append(tuple(action_dict['noisy_latents'].shape))
+
+            lat_grid_l.append(latent_dict['grid_id'].permute(1, 0, 2).flatten(1)[None])
+            act_grid_l.append(action_dict['grid_id'].permute(1, 0, 2).flatten(1)[None])
+
+            lat_ts = torch.cat([latent_dict['timesteps'].flatten(0, 1),
+                                latent_dict['cond_timesteps'].flatten(0, 1)])[None]
+            act_ts = torch.cat([action_dict['timesteps'].flatten(0, 1),
+                                action_dict['cond_timesteps'].flatten(0, 1)])[None]
+            H_lat, W_lat = latent_dict['noisy_latents'].shape[-2:]
+            H_act, W_act = action_dict['noisy_latents'].shape[-2:]
+            t_v, tp_v = self._time_embed(lat_ts, H_lat, W_lat, dtype=v_noise.dtype, action_mode=False)
+            t_a, tp_a = self._time_embed(act_ts, H_act, W_act, dtype=a_noise.dtype, action_mode=True)
+            lat_temb_l.append(t_v); lat_tproj_l.append(tp_v)
+            act_temb_l.append(t_a); act_tproj_l.append(tp_a)
+
+        batch_size = 1   # physical batch per episode is always 1; N episodes
+                          # are packed along the SEQUENCE axis, not a batch axis.
+
+        # episode-major concat: [ep0 noise, ep0 cond, ep1 noise, ep1 cond, ...]
+        video_states = torch.cat(
+            [x for i in range(n) for x in (v_noise_l[i], v_cond_l[i])], dim=1)
+        action_states = torch.cat(
+            [x for i in range(n) for x in (a_noise_l[i], a_cond_l[i])], dim=1)
+        text_hs = torch.cat(text_l, dim=1)
+        latent_temb  = torch.cat(lat_temb_l, dim=1)
+        latent_tproj = torch.cat(lat_tproj_l, dim=1)
+        action_temb  = torch.cat(act_temb_l, dim=1)
+        action_tproj = torch.cat(act_tproj_l, dim=1)
+
+        # rotary: same episode-major order as the streams above (noise/cond
+        # copies of a given episode share the SAME grid — physical position
+        # doesn't change with noise level, matching the single-episode path).
+        grid_video = torch.cat(
+            [x for i in range(n) for x in (lat_grid_l[i], lat_grid_l[i])], dim=2)
+        grid_action = torch.cat(
+            [x for i in range(n) for x in (act_grid_l[i], act_grid_l[i])], dim=2)
+        full_grid = torch.cat([grid_video, grid_action], dim=2)
+        rotary_emb = self.rope(full_grid)[:, :, None]
+
+        # ── pad to a multiple of 128 (FlexAttn block-mask alignment) — one
+        #    shared tail pad for the whole pack; seq_ids=-1 on this region
+        #    (set inside init_mask_packed) excludes it from every attention
+        #    relationship regardless of how many real episodes precede it. ──
+        L_v_total = video_states.shape[1]
+        L_a_total = action_states.shape[1]
+        total_length = L_v_total + L_a_total
+        padded_length = (128 - total_length % 128) % 128
+
+        if padded_length > 0:
+            action_states = F.pad(action_states, (0, 0, 0, padded_length))
+            rotary_emb = F.pad(rotary_emb, (0, 0, 0, 0, 0, padded_length))
+            action_tproj = F.pad(action_tproj, (0, 0, 0, 0, 0, padded_length))
+
+        FlexAttnFunc.init_mask_packed(
+            lat_shapes, act_shapes, text_lens, padded_length=padded_length,
+            chunk_size=input_dict["chunk_size"], window_size=input_dict['window_size'],
+            patch_size=self.patch_size, device=video_states.device,
+        )
+
+        for block in self.blocks:
+            # Module call (NOT block.forward_joint) so FSDP unshard and
+            # activation-checkpointing wrappers actually engage — see comment
+            # on WanMoTTransformerBlock.forward above.
+            video_states, action_states = block(
+                video_states, action_states, text_hs,
+                latent_tproj, action_tproj, rotary_emb, packed=True,
+            )
+
+        # ── video output head — gather each episode's own noise-token span
+        #    (non-contiguous across the episode-major layout: [noise,cond]
+        #    per episode), concatenate, project ONCE over the gathered
+        #    noise-only tokens (not once per episode). ────────────────────
+        v_sst = self.scale_shift_table[None] + latent_temb[:, :, None, ...]
+        shift_v, scale_v = [x.squeeze(1) for x in
+                            rearrange(v_sst, 'b l n c -> b n l c').chunk(2, dim=1)]
+        v_head = (self.norm_out(video_states.float()) * (1. + scale_v) + shift_v).type_as(video_states)
+
+        v_off = 0
+        v_noise_spans = []
+        for i in range(n):
+            v_noise_spans.append(v_head[:, v_off:v_off + L_v_noise[i]])
+            v_off += L_v_noise[i] + L_v_cond[i]
+        v_out = self.proj_out(torch.cat(v_noise_spans, dim=1))
+        v_out_list, off = [], 0
+        for i in range(n):
+            seg = v_out[:, off:off + L_v_noise[i]]
+            v_out_list.append(rearrange(
+                seg, '1 (b l) (n c) -> b (l n) c', n=math.prod(self.patch_size), b=batch_size))
+            off += L_v_noise[i]
+
+        # ── action output head — same pattern; action_temb is NOT padded (it
+        #    was computed before the 128-pad, at the true unpadded length), so
+        #    slice action_states down to match before combining, exactly as
+        #    the single-episode path does. ─────────────────────────────────
+        action_states_unpadded = action_states[:, :L_a_total]
+        a_sst = self.action_scale_shift_table_final[None] + action_temb[:, :, None, ...]
+        shift_a, scale_a = [x.squeeze(1) for x in
+                            rearrange(a_sst, 'b l n c -> b n l c').chunk(2, dim=1)]
+        a_head = (self.action_norm_out(action_states_unpadded.float()) *
+                 (1. + scale_a) + shift_a).type_as(action_states)
+
+        a_off = 0
+        a_noise_spans = []
+        for i in range(n):
+            a_noise_spans.append(a_head[:, a_off:a_off + L_a_noise[i]])
+            a_off += L_a_noise[i] + L_a_cond[i]
+        a_out = self.action_proj_out(torch.cat(a_noise_spans, dim=1))
+        a_out_list, off = [], 0
+        for i in range(n):
+            seg = a_out[:, off:off + L_a_noise[i]]
+            a_out_list.append(rearrange(seg, '1 (b l) c -> b l c', b=batch_size))
+            off += L_a_noise[i]
+
+        return v_out_list, a_out_list
 
     # ── inference forward (signature matches shared backbone) ──────────────
     def forward(
